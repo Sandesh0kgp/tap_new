@@ -11,8 +11,11 @@ import os
 import time
 import io
 import logging
+import requests
+from bs4 import BeautifulSoup
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 
 # Configure minimal logging
 logging.basicConfig(level=logging.WARNING)
@@ -42,6 +45,8 @@ if "search_results" not in st.session_state:
     st.session_state.search_results = {}
 if "drive_service" not in st.session_state:
     st.session_state.drive_service = None
+if "web_search_cache" not in st.session_state:
+    st.session_state.web_search_cache = {}
 
 # Google Drive integration functions
 def authenticate_google_drive(credentials_json):
@@ -77,20 +82,32 @@ def load_csv_from_drive_url(url):
         return None, f"Invalid URL format: {url}"
     try:
         path = f'https://drive.google.com/uc?export=download&id={file_id}'
-        return pd.read_csv(path), "Success"
+        df = pd.read_csv(path)
+        if df.empty:
+            return None, "Downloaded file is empty"
+        return df, "Success"
     except Exception as e:
-        return None, str(e)
+        return None, f"Error downloading or parsing file: {str(e)}"
 
 def load_csv_from_drive_service(drive_service, file_id):
+    if not drive_service or not file_id:
+        return None, "Missing drive service or file ID"
     try:
         request = drive_service.files().get_media(fileId=file_id)
         file_content = request.execute()
-        return pd.read_csv(io.BytesIO(file_content)), "Success"
+        df = pd.read_csv(io.BytesIO(file_content))
+        if df.empty:
+            return None, "Downloaded file is empty"
+        return df, "Success"
+    except HttpError as e:
+        return None, f"Google Drive API error: {str(e)}"
     except Exception as e:
-        return None, str(e)
+        return None, f"Error: {str(e)}"
 
 def validate_csv_file(df, expected_columns):
-    if df is None or df.empty:
+    if df is None:
+        return False, "DataFrame is None"
+    if df.empty:
         return False, "DataFrame is empty"
     missing_columns = [col for col in expected_columns if col not in df.columns]
     if missing_columns:
@@ -114,6 +131,9 @@ def load_data_from_drive(bond_urls, cashflow_url, company_url, drive_service=Non
             if not url:
                 continue
                 
+            # Log attempt to load file
+            st.write(f"Attempting to load bond file {i+1}...")
+                
             if drive_service:
                 file_id = get_file_id_from_url(url)
                 df, message = load_csv_from_drive_service(drive_service, file_id)
@@ -123,11 +143,14 @@ def load_data_from_drive(bond_urls, cashflow_url, company_url, drive_service=Non
             if df is not None:
                 is_valid, validation_message = validate_csv_file(df, ['isin', 'company_name'])
                 if is_valid:
+                    st.write(f"Successfully loaded bond file {i+1} with {len(df)} records")
                     bond_dfs.append(df)
                 else:
+                    st.write(f"Bond file {i+1} validation failed: {validation_message}")
                     status["bond"]["status"] = "error"
                     status["bond"]["message"] = f"Bond file {i+1}: {validation_message}"
             else:
+                st.write(f"Failed to load bond file {i+1}: {message}")
                 status["bond"]["status"] = "error"
                 status["bond"]["message"] = f"Error reading bond file {i+1}: {message}"
         
@@ -137,9 +160,11 @@ def load_data_from_drive(bond_urls, cashflow_url, company_url, drive_service=Non
                 bond_details = bond_details.drop_duplicates(subset=['isin'], keep='first')
                 status["bond"]["status"] = "success"
                 status["bond"]["message"] = f"Loaded {len(bond_details)} bonds"
+                st.write(f"Successfully concatenated {len(bond_dfs)} bond files with {len(bond_details)} total records")
             except Exception as e:
                 status["bond"]["status"] = "error"
                 status["bond"]["message"] = f"Error concatenating bond data: {str(e)}"
+                st.write(f"Error concatenating bond files: {str(e)}")
         elif status["bond"]["status"] != "error":
             status["bond"]["status"] = "error"
             status["bond"]["message"] = "No valid bond files processed"
@@ -219,10 +244,48 @@ def get_llm(api_key, model_option, temperature, max_tokens):
 
 def perform_web_search(query, num_results=3):
     try:
+        # Check if we have cached results
+        if query in st.session_state.web_search_cache:
+            return st.session_state.web_search_cache[query]
+            
         search = DuckDuckGoSearchAPIWrapper()
-        return search.results(query, num_results)
-    except Exception:
+        results = search.results(query, num_results)
+        
+        # Cache results
+        st.session_state.web_search_cache[query] = results
+        return results
+    except Exception as e:
+        logger.error(f"Web search error: {str(e)}")
         return []
+
+def scrape_webpage(url):
+    """Scrape content from a webpage"""
+    try:
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        }
+        response = requests.get(url, headers=headers, timeout=10)
+        response.raise_for_status()
+        
+        soup = BeautifulSoup(response.text, 'html.parser')
+        
+        # Remove script and style elements
+        for script in soup(["script", "style"]):
+            script.extract()
+            
+        # Get text
+        text = soup.get_text(separator='\n')
+        
+        # Clean up text
+        lines = (line.strip() for line in text.splitlines())
+        chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
+        text = '\n'.join(chunk for chunk in chunks if chunk)
+        
+        # Limit text length
+        return text[:5000]
+    except Exception as e:
+        logger.error(f"Error scraping webpage {url}: {str(e)}")
+        return f"Error scraping webpage: {str(e)}"
 
 # Data access functions
 def get_bond_details(bond_details, isin=None):
@@ -381,17 +444,15 @@ def process_web_search_query(query):
     if not search_terms:
         search_terms = "bond market news"
         
-    # Check if we have cached results
-    if search_terms in st.session_state.search_results:
-        return st.session_state.search_results[search_terms]
-        
     # Perform search
     results = perform_web_search(search_terms)
     
-    # Cache results
-    st.session_state.search_results[search_terms] = results
+    # Also try to scrape the first result for more context
+    if results and len(results) > 0 and 'link' in results[0]:
+        content = scrape_webpage(results[0]['link'])
+        return {"search_results": results, "scraped_content": content}
     
-    return results
+    return {"search_results": results}
 
 def process_bond_query(query, bond_details, isin=None):
     if isin:
@@ -516,11 +577,11 @@ def load_data(bond_files, cashflow_file, company_file):
         "company": {"status": "not_started", "message": ""}
     }
     
-    # Load and concatenate multiple bond files
+    # Process bond files
     if bond_files and any(bond_files):
         status["bond"]["status"] = "in_progress"
-        
         bond_dfs = []
+        
         for i, bf in enumerate(bond_files):
             if bf is None:
                 continue
@@ -528,7 +589,6 @@ def load_data(bond_files, cashflow_file, company_file):
             bond_path = save_uploadedfile(bf)
             if bond_path:
                 try:
-                    # Validate bond file format
                     is_valid, validation_message = validate_csv_file_path(bond_path, ['isin', 'company_name'])
                     
                     if is_valid:
@@ -562,12 +622,8 @@ def load_data(bond_files, cashflow_file, company_file):
         elif status["bond"]["status"] != "error":
             status["bond"]["status"] = "error"
             status["bond"]["message"] = "No valid bond files processed"
-    else:
-        status["bond"]["status"] = "not_started"
-        status["bond"]["message"] = "No bond files uploaded"
-        
-    # Process remaining files with similar pattern
-    # Cashflow file processing
+    
+    # Process cashflow file
     if cashflow_file:
         status["cashflow"]["status"] = "in_progress"
         cashflow_path = save_uploadedfile(cashflow_file)
@@ -596,7 +652,7 @@ def load_data(bond_files, cashflow_file, company_file):
                 except:
                     pass
     
-    # Company file processing
+    # Process company file
     if company_file:
         status["company"]["status"] = "in_progress"
         company_path = save_uploadedfile(company_file)
@@ -634,7 +690,7 @@ def main():
         api_key = st.text_input("Enter your GROQ API Key", type="password")
         
         st.markdown("### Google Drive Integration")
-        use_drive = st.checkbox("Use Google Drive for data files", value=False)
+        use_drive = st.checkbox("Use Google Drive for data files", value=True)
         
         if use_drive:
             # Google Drive authentication options
@@ -822,7 +878,7 @@ def main():
                 context.update(yield_result)
             elif query_type == "web_search":
                 search_results = process_web_search_query(query)
-                context["search_results"] = search_results
+                context.update(search_results)
             
             response = generate_response(context, llm)
             
@@ -869,4 +925,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
