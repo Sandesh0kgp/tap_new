@@ -13,9 +13,7 @@ import io
 import logging
 import requests
 from bs4 import BeautifulSoup
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
-from googleapiclient.errors import HttpError
+import gdown
 
 # Configure minimal logging
 logging.basicConfig(level=logging.WARNING)
@@ -43,25 +41,11 @@ if "last_load_attempt" not in st.session_state:
     st.session_state.last_load_attempt = 0
 if "search_results" not in st.session_state:
     st.session_state.search_results = {}
-if "drive_service" not in st.session_state:
-    st.session_state.drive_service = None
 if "web_search_cache" not in st.session_state:
     st.session_state.web_search_cache = {}
 
-# Google Drive integration functions
-def authenticate_google_drive(credentials_json):
-    try:
-        credentials_dict = json.loads(credentials_json)
-        credentials = service_account.Credentials.from_service_account_info(
-            credentials_dict,
-            scopes=['https://www.googleapis.com/auth/drive.readonly']
-        )
-        return build('drive', 'v3', credentials=credentials)
-    except Exception as e:
-        logger.error(f"Authentication error: {str(e)}")
-        return None
-
 def get_file_id_from_url(url):
+    """Extract file ID from Google Drive sharing URL"""
     if not url:
         return None
     try:
@@ -77,44 +61,60 @@ def get_file_id_from_url(url):
         return None
 
 def load_csv_from_drive_url(url):
+    """Load CSV from Google Drive sharing URL using gdown"""
     file_id = get_file_id_from_url(url)
     if not file_id:
         return None, f"Invalid URL format: {url}"
+    
     try:
-        path = f'https://drive.google.com/uc?export=download&id={file_id}'
-        df = pd.read_csv(path)
+        # Create a temporary file to download to
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.csv') as temp_file:
+            temp_path = temp_file.name
+        
+        # Download the file using gdown
+        download_url = f'https://drive.google.com/uc?id={file_id}'
+        gdown.download(download_url, temp_path, quiet=False)
+        
+        # Read the CSV file
+        df = pd.read_csv(temp_path)
+        
+        # Clean up
+        os.unlink(temp_path)
+        
         if df.empty:
             return None, "Downloaded file is empty"
+            
+        # Normalize column names (lowercase for case-insensitive comparison)
+        df.columns = [col.lower() for col in df.columns]
+        
         return df, "Success"
     except Exception as e:
+        # Clean up in case of error
+        try:
+            if 'temp_path' in locals():
+                os.unlink(temp_path)
+        except:
+            pass
         return None, f"Error downloading or parsing file: {str(e)}"
 
-def load_csv_from_drive_service(drive_service, file_id):
-    if not drive_service or not file_id:
-        return None, "Missing drive service or file ID"
-    try:
-        request = drive_service.files().get_media(fileId=file_id)
-        file_content = request.execute()
-        df = pd.read_csv(io.BytesIO(file_content))
-        if df.empty:
-            return None, "Downloaded file is empty"
-        return df, "Success"
-    except HttpError as e:
-        return None, f"Google Drive API error: {str(e)}"
-    except Exception as e:
-        return None, f"Error: {str(e)}"
-
 def validate_csv_file(df, expected_columns):
+    """Validate if DataFrame has the expected columns (case-insensitive)"""
     if df is None:
         return False, "DataFrame is None"
     if df.empty:
         return False, "DataFrame is empty"
-    missing_columns = [col for col in expected_columns if col not in df.columns]
+    
+    # Convert expected columns to lowercase for case-insensitive comparison
+    expected_columns_lower = [col.lower() for col in expected_columns]
+    df_columns_lower = [col.lower() for col in df.columns]
+    
+    missing_columns = [col for col in expected_columns_lower if col not in df_columns_lower]
     if missing_columns:
         return False, f"Missing columns: {', '.join(missing_columns)}"
     return True, "DataFrame validated successfully"
 
-def load_data_from_drive(bond_urls, cashflow_url, company_url, drive_service=None):
+def load_data_from_drive(bond_urls, cashflow_url, company_url):
+    """Load data from Google Drive URLs with improved error handling"""
     bond_details, cashflow_details, company_insights = None, None, None
     status = {
         "bond": {"status": "not_started", "message": ""}, 
@@ -133,22 +133,39 @@ def load_data_from_drive(bond_urls, cashflow_url, company_url, drive_service=Non
                 
             # Log attempt to load file
             st.write(f"Attempting to load bond file {i+1}...")
-                
-            if drive_service:
-                file_id = get_file_id_from_url(url)
-                df, message = load_csv_from_drive_service(drive_service, file_id)
-            else:
-                df, message = load_csv_from_drive_url(url)
+            
+            df, message = load_csv_from_drive_url(url)
             
             if df is not None:
+                # Check for both 'isin' and 'ISIN' columns (case-insensitive)
                 is_valid, validation_message = validate_csv_file(df, ['isin', 'company_name'])
+                
                 if is_valid:
                     st.write(f"Successfully loaded bond file {i+1} with {len(df)} records")
                     bond_dfs.append(df)
                 else:
                     st.write(f"Bond file {i+1} validation failed: {validation_message}")
-                    status["bond"]["status"] = "error"
-                    status["bond"]["message"] = f"Bond file {i+1}: {validation_message}"
+                    # Try to fix common issues
+                    if "Missing columns" in validation_message:
+                        # Check if columns exist with different capitalization
+                        if 'ISIN' in df.columns and 'isin' not in df.columns:
+                            df = df.rename(columns={'ISIN': 'isin'})
+                            st.write("Fixed: Renamed 'ISIN' to 'isin'")
+                        if 'COMPANY_NAME' in df.columns and 'company_name' not in df.columns:
+                            df = df.rename(columns={'COMPANY_NAME': 'company_name'})
+                            st.write("Fixed: Renamed 'COMPANY_NAME' to 'company_name'")
+                        
+                        # Check again after fixes
+                        is_valid, validation_message = validate_csv_file(df, ['isin', 'company_name'])
+                        if is_valid:
+                            st.write(f"Successfully fixed and loaded bond file {i+1} with {len(df)} records")
+                            bond_dfs.append(df)
+                        else:
+                            status["bond"]["status"] = "error"
+                            status["bond"]["message"] = f"Bond file {i+1}: {validation_message}"
+                    else:
+                        status["bond"]["status"] = "error"
+                        status["bond"]["message"] = f"Bond file {i+1}: {validation_message}"
             else:
                 st.write(f"Failed to load bond file {i+1}: {message}")
                 status["bond"]["status"] = "error"
@@ -176,11 +193,7 @@ def load_data_from_drive(bond_urls, cashflow_url, company_url, drive_service=Non
     if cashflow_url:
         status["cashflow"]["status"] = "in_progress"
         
-        if drive_service:
-            file_id = get_file_id_from_url(cashflow_url)
-            cashflow_details, message = load_csv_from_drive_service(drive_service, file_id)
-        else:
-            cashflow_details, message = load_csv_from_drive_url(cashflow_url)
+        cashflow_details, message = load_csv_from_drive_url(cashflow_url)
         
         if cashflow_details is not None:
             is_valid, validation_message = validate_csv_file(
@@ -190,9 +203,30 @@ def load_data_from_drive(bond_urls, cashflow_url, company_url, drive_service=Non
                 status["cashflow"]["status"] = "success"
                 status["cashflow"]["message"] = f"Loaded {len(cashflow_details)} cashflow records"
             else:
-                status["cashflow"]["status"] = "error"
-                status["cashflow"]["message"] = validation_message
-                cashflow_details = None
+                # Try to fix common issues
+                if "Missing columns" in validation_message:
+                    # Check if columns exist with different capitalization
+                    if 'ISIN' in cashflow_details.columns and 'isin' not in cashflow_details.columns:
+                        cashflow_details = cashflow_details.rename(columns={'ISIN': 'isin'})
+                    if 'CASH_FLOW_DATE' in cashflow_details.columns and 'cash_flow_date' not in cashflow_details.columns:
+                        cashflow_details = cashflow_details.rename(columns={'CASH_FLOW_DATE': 'cash_flow_date'})
+                    if 'CASH_FLOW_AMOUNT' in cashflow_details.columns and 'cash_flow_amount' not in cashflow_details.columns:
+                        cashflow_details = cashflow_details.rename(columns={'CASH_FLOW_AMOUNT': 'cash_flow_amount'})
+                    
+                    # Check again after fixes
+                    is_valid, validation_message = validate_csv_file(
+                        cashflow_details, ['isin', 'cash_flow_date', 'cash_flow_amount'])
+                    if is_valid:
+                        status["cashflow"]["status"] = "success"
+                        status["cashflow"]["message"] = f"Loaded {len(cashflow_details)} cashflow records"
+                    else:
+                        status["cashflow"]["status"] = "error"
+                        status["cashflow"]["message"] = validation_message
+                        cashflow_details = None
+                else:
+                    status["cashflow"]["status"] = "error"
+                    status["cashflow"]["message"] = validation_message
+                    cashflow_details = None
         else:
             status["cashflow"]["status"] = "error"
             status["cashflow"]["message"] = f"Error reading cashflow file: {message}"
@@ -204,11 +238,7 @@ def load_data_from_drive(bond_urls, cashflow_url, company_url, drive_service=Non
     if company_url:
         status["company"]["status"] = "in_progress"
         
-        if drive_service:
-            file_id = get_file_id_from_url(company_url)
-            company_insights, message = load_csv_from_drive_service(drive_service, file_id)
-        else:
-            company_insights, message = load_csv_from_drive_url(company_url)
+        company_insights, message = load_csv_from_drive_url(company_url)
         
         if company_insights is not None:
             is_valid, validation_message = validate_csv_file(company_insights, ['company_name'])
@@ -217,9 +247,25 @@ def load_data_from_drive(bond_urls, cashflow_url, company_url, drive_service=Non
                 status["company"]["status"] = "success"
                 status["company"]["message"] = f"Loaded {len(company_insights)} company records"
             else:
-                status["company"]["status"] = "error"
-                status["company"]["message"] = validation_message
-                company_insights = None
+                # Try to fix common issues
+                if "Missing columns" in validation_message:
+                    # Check if columns exist with different capitalization
+                    if 'COMPANY_NAME' in company_insights.columns and 'company_name' not in company_insights.columns:
+                        company_insights = company_insights.rename(columns={'COMPANY_NAME': 'company_name'})
+                    
+                    # Check again after fixes
+                    is_valid, validation_message = validate_csv_file(company_insights, ['company_name'])
+                    if is_valid:
+                        status["company"]["status"] = "success"
+                        status["company"]["message"] = f"Loaded {len(company_insights)} company records"
+                    else:
+                        status["company"]["status"] = "error"
+                        status["company"]["message"] = validation_message
+                        company_insights = None
+                else:
+                    status["company"]["status"] = "error"
+                    status["company"]["message"] = validation_message
+                    company_insights = None
         else:
             status["company"]["status"] = "error"
             status["company"]["message"] = f"Error reading company file: {message}"
@@ -547,141 +593,6 @@ def generate_response(context, llm):
     chain = prompt | llm | StrOutputParser()
     return chain.invoke({"query": context["query"], "query_type": context["query_type"], "context_str": context_str})
 
-def save_uploadedfile(uploadedfile):
-    """Save uploaded file to a temporary location and return the path"""
-    if uploadedfile is None:
-        return None
-    with tempfile.NamedTemporaryFile(delete=False, suffix='.csv') as f:
-        f.write(uploadedfile.getvalue())
-        return f.name
-
-def validate_csv_file_path(file_path, expected_columns):
-    """Validate if CSV file has the expected format"""
-    try:
-        df_header = pd.read_csv(file_path, nrows=0)
-        missing_columns = [col for col in expected_columns if col not in df_header.columns]
-        
-        if missing_columns:
-            return False, f"Missing columns: {', '.join(missing_columns)}"
-        
-        return True, "File validated successfully"
-    except Exception as e:
-        return False, f"Error validating file: {str(e)}"
-
-def load_data(bond_files, cashflow_file, company_file):
-    """Load data from uploaded files with error handling"""
-    bond_details, cashflow_details, company_insights = None, None, None
-    status = {
-        "bond": {"status": "not_started", "message": ""}, 
-        "cashflow": {"status": "not_started", "message": ""}, 
-        "company": {"status": "not_started", "message": ""}
-    }
-    
-    # Process bond files
-    if bond_files and any(bond_files):
-        status["bond"]["status"] = "in_progress"
-        bond_dfs = []
-        
-        for i, bf in enumerate(bond_files):
-            if bf is None:
-                continue
-                
-            bond_path = save_uploadedfile(bf)
-            if bond_path:
-                try:
-                    is_valid, validation_message = validate_csv_file_path(bond_path, ['isin', 'company_name'])
-                    
-                    if is_valid:
-                        df = pd.read_csv(bond_path)
-                        if not df.empty:
-                            bond_dfs.append(df)
-                        else:
-                            status["bond"]["status"] = "error"
-                            status["bond"]["message"] = f"Bond file {i+1} is empty"
-                    else:
-                        status["bond"]["status"] = "error"
-                        status["bond"]["message"] = f"Bond file {i+1}: {validation_message}"
-                except Exception as e:
-                    status["bond"]["status"] = "error"
-                    status["bond"]["message"] = f"Error reading bond file {i+1}: {str(e)}"
-                finally:
-                    try:
-                        os.unlink(bond_path)
-                    except:
-                        pass
-        
-        if bond_dfs:
-            try:
-                bond_details = pd.concat(bond_dfs, ignore_index=True)
-                bond_details = bond_details.drop_duplicates(subset=['isin'], keep='first')
-                status["bond"]["status"] = "success"
-                status["bond"]["message"] = f"Loaded {len(bond_details)} bonds"
-            except Exception as e:
-                status["bond"]["status"] = "error"
-                status["bond"]["message"] = f"Error concatenating bond data: {str(e)}"
-        elif status["bond"]["status"] != "error":
-            status["bond"]["status"] = "error"
-            status["bond"]["message"] = "No valid bond files processed"
-    
-    # Process cashflow file
-    if cashflow_file:
-        status["cashflow"]["status"] = "in_progress"
-        cashflow_path = save_uploadedfile(cashflow_file)
-        if cashflow_path:
-            try:
-                is_valid, validation_message = validate_csv_file_path(
-                    cashflow_path, ['isin', 'cash_flow_date', 'cash_flow_amount'])
-                
-                if is_valid:
-                    cashflow_details = pd.read_csv(cashflow_path)
-                    if not cashflow_details.empty:
-                        status["cashflow"]["status"] = "success"
-                        status["cashflow"]["message"] = f"Loaded {len(cashflow_details)} cashflow records"
-                    else:
-                        status["cashflow"]["status"] = "error"
-                        status["cashflow"]["message"] = "Cashflow file is empty"
-                else:
-                    status["cashflow"]["status"] = "error"
-                    status["cashflow"]["message"] = validation_message
-            except Exception as e:
-                status["cashflow"]["status"] = "error"
-                status["cashflow"]["message"] = f"Error reading cashflow file: {str(e)}"
-            finally:
-                try:
-                    os.unlink(cashflow_path)
-                except:
-                    pass
-    
-    # Process company file
-    if company_file:
-        status["company"]["status"] = "in_progress"
-        company_path = save_uploadedfile(company_file)
-        if company_path:
-            try:
-                is_valid, validation_message = validate_csv_file_path(company_path, ['company_name'])
-                
-                if is_valid:
-                    company_insights = pd.read_csv(company_path)
-                    if not company_insights.empty:
-                        status["company"]["status"] = "success"
-                        status["company"]["message"] = f"Loaded {len(company_insights)} company records"
-                    else:
-                        status["company"]["status"] = "error"
-                        status["company"]["message"] = "Company file is empty"
-                else:
-                    status["company"]["status"] = "error"
-                    status["company"]["message"] = validation_message
-            except Exception as e:
-                status["company"]["status"] = "error"
-                status["company"]["message"] = f"Error reading company file: {str(e)}"
-            finally:
-                try:
-                    os.unlink(company_path)
-                except:
-                    pass
-    
-    return bond_details, cashflow_details, company_insights, status
-
 def main():
     """Main application function"""
     # Sidebar for configuration
@@ -690,88 +601,41 @@ def main():
         api_key = st.text_input("Enter your GROQ API Key", type="password")
         
         st.markdown("### Google Drive Integration")
-        use_drive = st.checkbox("Use Google Drive for data files", value=True)
         
-        if use_drive:
-            # Google Drive authentication options
-            auth_method = st.radio(
-                "Authentication Method",
-                ["Service Account", "Direct URLs"]
+        # File URL inputs
+        st.markdown("#### Bond Detail Files URLs")
+        bond_urls = []
+        for i in range(4):  # Allow up to 4 bond file parts
+            bond_url = st.text_input(
+                f"Bond Details CSV Part {i+1} URL", 
+                key=f"bond_url_{i}",
+                help="Enter Google Drive sharing URL"
             )
-            
-            if auth_method == "Service Account":
-                credentials_json = st.text_area(
-                    "Enter Service Account JSON credentials",
-                    height=150,
-                    help="Paste the entire JSON content of your service account key file"
+            bond_urls.append(bond_url)
+        
+        cashflow_url = st.text_input(
+            "Cashflow Details CSV URL",
+            help="Enter Google Drive sharing URL"
+        )
+        
+        company_url = st.text_input(
+            "Company Insights CSV URL",
+            help="Enter Google Drive sharing URL"
+        )
+        
+        if st.button("Load Data from Drive"):
+            with st.spinner("Loading data from Google Drive..."):
+                st.session_state.last_load_attempt = time.time()
+                st.session_state.bond_details, st.session_state.cashflow_details, st.session_state.company_insights, st.session_state.data_loading_status = load_data_from_drive(
+                    bond_urls, cashflow_url, company_url
                 )
                 
-                if credentials_json and st.button("Authenticate"):
-                    with st.spinner("Authenticating with Google Drive..."):
-                        drive_service = authenticate_google_drive(credentials_json)
-                        if drive_service:
-                            st.session_state.drive_service = drive_service
-                            st.success("Successfully authenticated with Google Drive!")
-                        else:
-                            st.error("Failed to authenticate with Google Drive. Check your credentials.")
-            
-            # File URL inputs
-            st.markdown("#### Bond Detail Files URLs")
-            bond_urls = []
-            for i in range(4):  # Allow up to 4 bond file parts
-                bond_url = st.text_input(
-                    f"Bond Details CSV Part {i+1} URL", 
-                    key=f"bond_url_{i}",
-                    help="Enter Google Drive sharing URL"
-                )
-                bond_urls.append(bond_url)
-            
-            cashflow_url = st.text_input(
-                "Cashflow Details CSV URL",
-                help="Enter Google Drive sharing URL"
-            )
-            
-            company_url = st.text_input(
-                "Company Insights CSV URL",
-                help="Enter Google Drive sharing URL"
-            )
-            
-            if st.button("Load Data from Drive"):
-                with st.spinner("Loading data from Google Drive..."):
-                    st.session_state.last_load_attempt = time.time()
-                    st.session_state.bond_details, st.session_state.cashflow_details, st.session_state.company_insights, st.session_state.data_loading_status = load_data_from_drive(
-                        bond_urls, cashflow_url, company_url, st.session_state.drive_service
-                    )
-                    
-                    if (st.session_state.bond_details is not None or 
-                        st.session_state.cashflow_details is not None or 
-                        st.session_state.company_insights is not None):
-                        st.success("Data loaded successfully from Google Drive!")
-                    else:
-                        st.error("Failed to load data from Google Drive. Check the Debug Information.")
-        else:
-            # File upload method
-            st.markdown("### Upload Data Files")
-            bond_files = []
-            for i in range(2):
-                bond_file = st.file_uploader(f"Upload Bond Details CSV Part {i+1}", type=["csv"], key=f"bond_file_{i}")
-                bond_files.append(bond_file)
-            
-            cashflow_file = st.file_uploader("Upload Cashflow Details CSV", type=["csv"])
-            company_file = st.file_uploader("Upload Company Insights CSV", type=["csv"])
-            
-            if st.button("Load Data"):
-                with st.spinner("Loading data..."):
-                    st.session_state.last_load_attempt = time.time()
-                    st.session_state.bond_details, st.session_state.cashflow_details, st.session_state.company_insights, st.session_state.data_loading_status = load_data(
-                        bond_files, cashflow_file, company_file
-                    )
-                    if (st.session_state.bond_details is not None or 
-                        st.session_state.cashflow_details is not None or 
-                        st.session_state.company_insights is not None):
-                        st.success("Data loaded successfully!")
-                    else:
-                        st.error("Failed to load data. Check the Debug Information.")
+                if (st.session_state.bond_details is not None or 
+                    st.session_state.cashflow_details is not None or 
+                    st.session_state.company_insights is not None):
+                    st.success("Data loaded successfully from Google Drive!")
+                else:
+                    st.error("Failed to load data from Google Drive. Check the Debug Information.")
         
         # Model configuration
         st.markdown("### Model Configuration")
@@ -903,11 +767,6 @@ def main():
         st.write(f"- Bond Details: {display_status_indicator(st.session_state.data_loading_status['bond']['status'])} {st.session_state.data_loading_status['bond']['message']}")
         st.write(f"- Cashflow Details: {display_status_indicator(st.session_state.data_loading_status['cashflow']['status'])} {st.session_state.data_loading_status['cashflow']['message']}")
         st.write(f"- Company Insights: {display_status_indicator(st.session_state.data_loading_status['company']['status'])} {st.session_state.data_loading_status['company']['message']}")
-        
-        if st.session_state.drive_service:
-            st.write("- Google Drive: ✅ Connected")
-        else:
-            st.write("- Google Drive: ⚪ Not connected")
         
         # Add data sample viewer
         if st.checkbox("Show Data Samples"):
