@@ -73,10 +73,21 @@ def load_csv_from_drive_url(url):
         
         # Download the file using gdown
         download_url = f'https://drive.google.com/uc?id={file_id}'
+        st.write(f"Attempting to download from: {download_url}")
         gdown.download(download_url, temp_path, quiet=False)
         
+        # Check if file exists and has content
+        if os.path.exists(temp_path) and os.path.getsize(temp_path) > 0:
+            st.write(f"File downloaded successfully, size: {os.path.getsize(temp_path)} bytes")
+        else:
+            st.write("File download failed or file is empty")
+            return None, "Downloaded file is empty or missing"
+            
         # Read the CSV file
         df = pd.read_csv(temp_path)
+        
+        # Display column information for debugging
+        st.write(f"Columns in downloaded file: {list(df.columns)}")
         
         # Clean up
         os.unlink(temp_path)
@@ -417,6 +428,11 @@ def calculate_yield(bond_details, isin, price=None):
     }
 
 def process_query(query, bond_details, cashflow_details, company_insights):
+    # First, check if data is loaded
+    data_loaded = (bond_details is not None or 
+                  cashflow_details is not None or 
+                  company_insights is not None)
+    
     # Extract ISIN if present
     isin = None
     for word in query.split():
@@ -441,18 +457,24 @@ def process_query(query, bond_details, cashflow_details, company_insights):
         if len(parts) > 1 and len(parts[1].strip()) > 0:
             company_name = parts[1].strip()
     
-    # Determine query type
+    # Determine query type with stronger prioritization of local data
     query_type = "unknown"
     query_lower = query.lower()
-    if "cash flow" in query_lower or "cashflow" in query_lower:
-        query_type = "cashflow"
+    
+    # Prioritize local data types over web search
+    if isin or "isin" in query_lower:
+        if "cash flow" in query_lower or "cashflow" in query_lower:
+            query_type = "cashflow"
+        else:
+            query_type = "bond"
     elif "yield" in query_lower or "calculate" in query_lower:
         query_type = "yield"
     elif "company" in query_lower or "issuer" in query_lower:
         query_type = "company"
     elif "detail" in query_lower or "information" in query_lower or "about" in query_lower:
         query_type = "bond"
-    elif "search" in query_lower or "find" in query_lower or "web" in query_lower:
+    # Only use web search if explicitly requested or no local data
+    elif ("search" in query_lower or "find" in query_lower or "web" in query_lower) or not data_loaded:
         query_type = "web_search"
     
     # Prepare context
@@ -568,6 +590,24 @@ def generate_response(context, llm):
         
     if "data_status" in context:
         return f"I need more data to answer your question. {context['data_status']}"
+    
+    # Handle specific query types with formatted responses
+    query_type = context.get("query_type")
+    
+    if query_type == "bond" and "search_results" in context:
+        # Format bond search results according to sample prompts
+        bonds = context["search_results"]
+        response = "## Bond Details\n\n"
+        for bond in bonds[:5]:  # Limit to 5 results
+            if "error" in bond:
+                response += f"{bond['error']}\n"
+                continue
+            response += f"**ISIN**: {bond.get('isin', 'N/A')}\n"
+            response += f"**Issuer**: {bond.get('company_name', 'N/A')}\n"
+            if 'coupon_details' in bond and isinstance(bond['coupon_details'], dict):
+                response += f"**Coupon Rate**: {bond['coupon_details'].get('rate', 'N/A')}%\n"
+            response += "---\n"
+        return response
     
     template = """You are a helpful financial assistant specializing in bonds.
     User Query: {query}
