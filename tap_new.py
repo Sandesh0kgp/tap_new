@@ -45,6 +45,18 @@ if "search_results" not in st.session_state:
 if "web_search_cache" not in st.session_state:
     st.session_state.web_search_cache = {}
 
+# Add the missing function
+def display_status_indicator(status):
+    """Use ASCII-compatible status indicators"""
+    if status == "success":
+        return "[SUCCESS]"  # Instead of "✅"
+    elif status == "error":
+        return "[ERROR]"    # Instead of "❌"
+    elif status == "in_progress":
+        return "[IN PROGRESS]"  # Instead of "⏳"
+    else:
+        return "[NOT STARTED]"  # Instead of "⚪"
+
 def get_file_id_from_url(url):
     """Extract file ID from Google Drive sharing URL"""
     if not url:
@@ -347,7 +359,6 @@ def scrape_webpage(url):
 
 # Data access functions
 def get_bond_details(bond_details, isin=None):
-    """Get bond details by ISIN"""
     if bond_details is None:
         return {"error": "Bond data not loaded"}
     
@@ -364,7 +375,6 @@ def get_bond_details(bond_details, isin=None):
     return {"error": f"Bond with ISIN {isin} not found"}
 
 def search_bond_by_text(bond_details, text):
-    """Search bonds by text"""
     if bond_details is None:
         return [{"error": "Bond data not loaded"}]
     
