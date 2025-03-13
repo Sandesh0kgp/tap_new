@@ -568,6 +568,65 @@ def format_filter_results(filter_data):
     
     return response
 
+def process_query(query, bond_details, cashflow_details, company_insights):
+    # Extract ISIN if present
+    isin = None
+    for word in query.split():
+        clean_word = ''.join(c for c in word if c.isalnum() or c in ".")
+        if clean_word.upper().startswith("INE") and len(clean_word) >= 10:
+            isin = clean_word.upper()
+            break
+    
+    # Extract price if present
+    price = None
+    for word in query.split():
+        if word.startswith("$"):
+            try:
+                price = float(word[1:])
+            except ValueError:
+                pass
+    
+    # Extract company name
+    company_name = None
+    if "company" in query.lower():
+        parts = query.lower().split("company")
+        if len(parts) > 1 and len(parts[1].strip()) > 0:
+            company_name = parts[1].strip()
+    
+    # Determine query type
+    query_type = "unknown"
+    query_lower = query.lower()
+    if "cash flow" in query_lower or "cashflow" in query_lower:
+        query_type = "cashflow"
+    elif "yield" in query_lower or "calculate" in query_lower:
+        query_type = "yield"
+    elif "company" in query_lower or "issuer" in query_lower:
+        query_type = "company"
+    elif "detail" in query_lower or "information" in query_lower or "about" in query_lower:
+        query_type = "bond"
+    elif "search" in query_lower or "find" in query_lower or "web" in query_lower:
+        query_type = "web_search"
+    
+    # Prepare context
+    context = {
+        "query": query,
+        "query_type": query_type,
+        "isin": isin,
+        "company_name": company_name,
+        "price": price
+    }
+    
+    # Check for data availability
+    if bond_details is None and query_type in ["bond", "yield"]:
+        context["data_status"] = "Bond data not loaded. Please upload bond files."
+    if cashflow_details is None and query_type == "cashflow":
+        context["data_status"] = "Cashflow data not loaded. Please upload cashflow file."
+    if company_insights is None and query_type == "company":
+        context["data_status"] = "Company data not loaded. Please upload company insights file."
+
+    return context
+
+
 def main():
     """Main application function"""
     # Sidebar for configuration
