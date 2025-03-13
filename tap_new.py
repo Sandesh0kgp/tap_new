@@ -14,6 +14,7 @@ import logging
 import requests
 from bs4 import BeautifulSoup
 import gdown
+import re
 
 # Configure minimal logging
 logging.basicConfig(level=logging.WARNING)
@@ -427,6 +428,22 @@ def calculate_yield(bond_details, isin, price=None):
         "yield": round(simple_yield, 2)
     }
 
+def extract_isin(text):
+    """Extract ISIN from text - improved version"""
+    # Standard ISIN pattern for Indian bonds starting with INE
+    isin_pattern = r'\b(INE[A-Z0-9]{9})\b'
+    matches = re.findall(isin_pattern, text.upper())
+    if matches:
+        return matches[0]
+    
+    # Look for any word that might be an ISIN
+    for word in text.split():
+        clean_word = ''.join(c for c in word if c.isalnum() or c in ".")
+        if clean_word.upper().startswith("INE") and len(clean_word) >= 10:
+            return clean_word.upper()
+    
+    return None
+
 def process_query(query, bond_details, cashflow_details, company_insights):
     # First, check if data is loaded
     data_loaded = (bond_details is not None or 
@@ -434,21 +451,17 @@ def process_query(query, bond_details, cashflow_details, company_insights):
                   company_insights is not None)
     
     # Extract ISIN if present
-    isin = None
-    for word in query.split():
-        clean_word = ''.join(c for c in word if c.isalnum() or c in ".")
-        if clean_word.upper().startswith("INE") and len(clean_word) >= 10:
-            isin = clean_word.upper()
-            break
+    isin = extract_isin(query)
     
     # Extract price if present
     price = None
-    for word in query.split():
-        if word.startswith("$"):
-            try:
-                price = float(word[1:])
-            except ValueError:
-                pass
+    price_pattern = r'\$(\d+\.?\d*)'
+    price_matches = re.findall(price_pattern, query)
+    if price_matches:
+        try:
+            price = float(price_matches[0])
+        except ValueError:
+            pass
     
     # Extract company name
     company_name = None
@@ -462,16 +475,13 @@ def process_query(query, bond_details, cashflow_details, company_insights):
     query_lower = query.lower()
     
     # Prioritize local data types over web search
-    if isin or "isin" in query_lower:
-        if "cash flow" in query_lower or "cashflow" in query_lower:
-            query_type = "cashflow"
-        else:
-            query_type = "bond"
+    if "cash flow" in query_lower or "cashflow" in query_lower:
+        query_type = "cashflow"
     elif "yield" in query_lower or "calculate" in query_lower:
         query_type = "yield"
     elif "company" in query_lower or "issuer" in query_lower:
         query_type = "company"
-    elif "detail" in query_lower or "information" in query_lower or "about" in query_lower:
+    elif isin or "isin" in query_lower or "details" in query_lower or "show" in query_lower:
         query_type = "bond"
     # Only use web search if explicitly requested or no local data
     elif ("search" in query_lower or "find" in query_lower or "web" in query_lower) or not data_loaded:
@@ -497,6 +507,7 @@ def process_query(query, bond_details, cashflow_details, company_insights):
     return context
 
 def display_status_indicator(status):
+    """Use ASCII-compatible status indicators"""
     if status == "success":
         return "[SUCCESS]"  # Instead of "✅"
     elif status == "error":
@@ -505,7 +516,6 @@ def display_status_indicator(status):
         return "[IN PROGRESS]"  # Instead of "⏳"
     else:
         return "[NOT STARTED]"  # Instead of "⚪"
-
 
 def process_web_search_query(query):
     # Extract search terms
@@ -528,7 +538,7 @@ def process_bond_query(query, bond_details, isin=None):
         return get_bond_details(bond_details, isin)
         
     # Try to extract search terms
-    search_terms = query.lower().replace("bond", "").replace("details", "").replace("about", "").strip()
+    search_terms = query.lower().replace("bond", "").replace("details", "").replace("about", "").replace("show", "").strip()
     if search_terms:
         return {"search_results": search_bond_by_text(bond_details, search_terms)}
         
@@ -542,10 +552,9 @@ def process_cashflow_query(query, cashflow_details, isin=None):
     search_terms = query.lower().replace("cashflow", "").replace("cash flow", "").replace("for", "").strip()
     if search_terms:
         # Try to find an ISIN in the search terms
-        for word in search_terms.split():
-            clean_word = ''.join(c for c in word if c.isalnum() or c in ".")
-            if clean_word.upper().startswith("INE") and len(clean_word) >= 10:
-                return {"cashflow": get_cashflow(cashflow_details, clean_word.upper())}
+        extracted_isin = extract_isin(search_terms)
+        if extracted_isin:
+            return {"cashflow": get_cashflow(cashflow_details, extracted_isin)}
                 
     return {"error": "Please provide an ISIN to find cashflow details"}
 
@@ -566,13 +575,14 @@ def process_yield_query(query, bond_details, isin=None, price=None):
         
     # Try to extract price from query if ISIN exists
     if isin and not price:
-        for word in query.split():
-            if word.startswith("$"):
-                try:
-                    price = float(word[1:])
-                    return calculate_yield(bond_details, isin, price)
-                except ValueError:
-                    pass
+        price_pattern = r'\$(\d+\.?\d*)'
+        price_matches = re.findall(price_pattern, query)
+        if price_matches:
+            try:
+                price = float(price_matches[0])
+                return calculate_yield(bond_details, isin, price)
+            except ValueError:
+                pass
                     
     # Return error if missing parameters
     if not isin:
@@ -582,7 +592,159 @@ def process_yield_query(query, bond_details, isin=None, price=None):
         
     return {"error": "Could not process yield calculation"}
 
+def format_bond_details_response(bond_data):
+    """Format bond details according to sample responses"""
+    if "error" in bond_data:
+        return f"Error: {bond_data['error']}"
+    
+    response = f"## Bond Details for {bond_data.get('isin', 'Unknown ISIN')}\n\n"
+    
+    # Basic bond information
+    response += f"**Issuer**: {bond_data.get('company_name', 'N/A')}\n"
+    
+    # Coupon details
+    coupon_details = bond_data.get('coupon_details', {})
+    if isinstance(coupon_details, dict):
+        response += f"**Coupon Rate**: {coupon_details.get('rate', 'N/A')}%\n"
+        response += f"**Coupon Type**: {coupon_details.get('type', 'N/A')}\n"
+        response += f"**Coupon Frequency**: {coupon_details.get('frequency', 'N/A')}\n"
+    
+    # Instrument details
+    instrument_details = bond_data.get('instrument_details', {})
+    if isinstance(instrument_details, dict):
+        response += f"**Issue Date**: {instrument_details.get('issue_date', 'N/A')}\n"
+        response += f"**Maturity Date**: {instrument_details.get('maturity_date', 'N/A')}\n"
+        response += f"**Issue Size**: ₹{instrument_details.get('issue_size', 'N/A')}\n"
+        response += f"**Face Value**: ₹{instrument_details.get('face_value', 'N/A')}\n"
+    
+    # Issuer details
+    issuer_details = bond_data.get('issuer_details', {})
+    if isinstance(issuer_details, dict):
+        response += f"**Sector**: {issuer_details.get('sector', 'N/A')}\n"
+        response += f"**Industry**: {issuer_details.get('industry', 'N/A')}\n"
+        response += f"**Credit Rating**: {issuer_details.get('credit_rating', 'N/A')}\n"
+    
+    return response
+
+def format_cashflow_response(cashflow_data, isin):
+    """Format cashflow response according to sample responses"""
+    if isinstance(cashflow_data, list) and "error" in cashflow_data[0]:
+        return f"Error: {cashflow_data[0]['error']}"
+    
+    response = f"## Cash Flow Schedule for {isin}\n\n"
+    
+    if not cashflow_data or len(cashflow_data) == 0:
+        return response + "No cash flow data available for this bond."
+    
+    # Create a table header
+    response += "| Cash Flow Date | Cash Flow Amount | Record Date | Principal Amount | Interest Amount | TDS Amount | Remaining Principal |\n"
+    response += "|---------------|-----------------|-------------|-------------------|----------------|------------|---------------------|\n"
+    
+    # Add each cash flow as a row
+    for cf in cashflow_data:
+        response += f"| {cf.get('cash_flow_date', 'N/A')} "
+        response += f"| {cf.get('cash_flow_amount', 'N/A')} "
+        response += f"| {cf.get('record_date', 'N/A')} "
+        response += f"| {cf.get('principal_amount', 0.0)} "
+        response += f"| {cf.get('interest_amount', 'N/A')} "
+        response += f"| {cf.get('tds_amount', 'N/A')} "
+        response += f"| {cf.get('remaining_principal', 'N/A')} |\n"
+    
+    response += "\nPlease note that this cash flow schedule is based on the provided data and may not reflect the actual cash flows of the bond."
+    
+    return response
+
+def format_yield_response(yield_data):
+    """Format yield calculation response according to sample responses"""
+    if "error" in yield_data:
+        return f"Error: {yield_data['error']}"
+    
+    bond_data = yield_data.get("bond", {})
+    price = yield_data.get("price", 0)
+    yield_value = yield_data.get("yield", 0)
+    
+    response = f"## Yield Calculation for {bond_data.get('isin', 'Unknown ISIN')}\n\n"
+    
+    response += f"**Bond**: {bond_data.get('company_name', 'N/A')} ({bond_data.get('isin', 'N/A')})\n"
+    
+    # Coupon details
+    coupon_details = bond_data.get('coupon_details', {})
+    if isinstance(coupon_details, dict):
+        response += f"**Coupon Rate**: {coupon_details.get('rate', 'N/A')}%\n"
+    
+    response += f"**Price**: ${price}\n"
+    response += f"**Calculated Yield**: {yield_value}%\n\n"
+    
+    response += "The yield is calculated using the simple formula: (Coupon Rate / Price) * 100\n"
+    response += "For a more accurate yield calculation, please consider using a financial calculator that accounts for time value of money."
+    
+    return response
+
+def format_company_response(company_data):
+    """Format company information response according to sample responses"""
+    if "error" in company_data:
+        return f"Error: {company_data['error']}"
+    
+    response = f"## Company Information: {company_data.get('company_name', 'Unknown Company')}\n\n"
+    
+    # Key metrics
+    key_metrics = company_data.get('key_metrics', {})
+    if isinstance(key_metrics, dict) and key_metrics:
+        response += "### Key Financial Metrics\n\n"
+        for key, value in key_metrics.items():
+            response += f"**{key.replace('_', ' ').title()}**: {value}\n"
+        response += "\n"
+    
+    # Income statement
+    income_statement = company_data.get('income_statement', {})
+    if isinstance(income_statement, dict) and income_statement:
+        response += "### Income Statement Highlights\n\n"
+        for key, value in income_statement.items():
+            response += f"**{key.replace('_', ' ').title()}**: ₹{value}\n"
+        response += "\n"
+    
+    # Balance sheet
+    balance_sheet = company_data.get('balance_sheet', {})
+    if isinstance(balance_sheet, dict) and balance_sheet:
+        response += "### Balance Sheet Highlights\n\n"
+        for key, value in balance_sheet.items():
+            response += f"**{key.replace('_', ' ').title()}**: ₹{value}\n"
+        response += "\n"
+    
+    # Cash flow
+    cashflow = company_data.get('cashflow', {})
+    if isinstance(cashflow, dict) and cashflow:
+        response += "### Cash Flow Highlights\n\n"
+        for key, value in cashflow.items():
+            response += f"**{key.replace('_', ' ').title()}**: ₹{value}\n"
+    
+    return response
+
+def format_web_search_response(search_data):
+    """Format web search response"""
+    search_results = search_data.get("search_results", [])
+    scraped_content = search_data.get("scraped_content", "")
+    
+    if not search_results:
+        return "No web search results found. Please try a different query."
+    
+    response = "## Web Search Results\n\n"
+    
+    for i, result in enumerate(search_results[:3]):
+        response += f"### {i+1}. {result.get('title', 'No Title')}\n"
+        response += f"**Source**: {result.get('link', 'No Link')}\n"
+        response += f"{result.get('snippet', 'No snippet available')}\n\n"
+    
+    if scraped_content:
+        response += "### Additional Information\n"
+        response += scraped_content[:500] + "...\n\n"
+    
+    response += "Please note that these results are from a web search and may not be specific to the Tap Bonds platform."
+    
+    return response
+
 def generate_response(context, llm):
+    """Generate a response based on context and query type"""
     if llm is None:
         return "Please enter a valid GROQ API key in the sidebar to continue."
     
@@ -592,24 +754,47 @@ def generate_response(context, llm):
     if "data_status" in context:
         return f"I need more data to answer your question. {context['data_status']}"
     
-    # Handle specific query types with formatted responses
-    query_type = context.get("query_type")
+    # Format response based on query type
+    query_type = context.get("query_type", "unknown")
     
-    if query_type == "bond" and "search_results" in context:
-        # Format bond search results according to sample prompts
-        bonds = context["search_results"]
-        response = "## Bond Details\n\n"
-        for bond in bonds[:5]:  # Limit to 5 results
-            if "error" in bond:
-                response += f"{bond['error']}\n"
-                continue
-            response += f"**ISIN**: {bond.get('isin', 'N/A')}\n"
-            response += f"**Issuer**: {bond.get('company_name', 'N/A')}\n"
-            if 'coupon_details' in bond and isinstance(bond['coupon_details'], dict):
-                response += f"**Coupon Rate**: {bond['coupon_details'].get('rate', 'N/A')}%\n"
-            response += "---\n"
-        return response
+    # Bond details response
+    if query_type == "bond":
+        if "search_results" in context:
+            bonds = context["search_results"]
+            if len(bonds) == 1:
+                return format_bond_details_response(bonds[0])
+            else:
+                response = "## Bond Search Results\n\n"
+                for i, bond in enumerate(bonds[:5]):
+                    if "error" in bond:
+                        response += f"{bond['error']}\n"
+                        continue
+                    response += f"### Bond {i+1}: {bond.get('company_name', 'N/A')}\n"
+                    response += f"**ISIN**: {bond.get('isin', 'N/A')}\n"
+                    if 'coupon_details' in bond and isinstance(bond['coupon_details'], dict):
+                        response += f"**Coupon Rate**: {bond['coupon_details'].get('rate', 'N/A')}%\n"
+                    response += "---\n"
+                return response
+        else:
+            return format_bond_details_response(context)
     
+    # Cash flow response
+    elif query_type == "cashflow" and "cashflow" in context:
+        return format_cashflow_response(context["cashflow"], context.get("isin", "Unknown ISIN"))
+    
+    # Yield calculation response
+    elif query_type == "yield":
+        return format_yield_response(context)
+    
+    # Company information response
+    elif query_type == "company":
+        return format_company_response(context)
+    
+    # Web search response
+    elif query_type == "web_search" and "search_results" in context:
+        return format_web_search_response(context)
+    
+    # Default response using LLM
     template = """You are a helpful financial assistant specializing in bonds.
     User Query: {query}
     Query Type: {query_type}
@@ -790,9 +975,9 @@ def main():
             # Add bot response to history
             st.session_state.chat_history.append({"role": "assistant", "content": response})
 
-    # Display chat history
+    # Display chat history in reverse order (newest first)
     st.markdown("### Conversation")
-    for message in st.session_state.chat_history:
+    for message in reversed(st.session_state.chat_history):
         if message["role"] == "user":
             st.markdown(f"**You**: {message['content']}")
         else:
