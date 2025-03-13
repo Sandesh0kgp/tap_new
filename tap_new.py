@@ -498,13 +498,14 @@ def process_query(query, bond_details, cashflow_details, company_insights):
 
 def display_status_indicator(status):
     if status == "success":
-        return "✅"
+        return "[SUCCESS]"  # Instead of "✅"
     elif status == "error":
-        return "❌"
+        return "[ERROR]"    # Instead of "❌"
     elif status == "in_progress":
-        return "⏳"
+        return "[IN PROGRESS]"  # Instead of "⏳"
     else:
-        return "⚪"
+        return "[NOT STARTED]"  # Instead of "⚪"
+
 
 def process_web_search_query(query):
     # Extract search terms
